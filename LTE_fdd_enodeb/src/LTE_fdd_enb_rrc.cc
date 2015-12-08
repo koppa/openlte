@@ -42,6 +42,11 @@
                                    PDCP config to SRB2.
     02/15/2015    Ben Wojtowicz    Moved to new message queue and using the
                                    fixed user switch.
+    07/25/2015    Ben Wojtowicz    Using the new user QoS structure, moved DRBs
+                                   to RLC AM, and changed the default time
+                                   alignment timer to 10240 subframes.
+    12/06/2015    Ben Wojtowicz    Changed boost::mutex to pthread_mutex_t and
+                                   sem_t.
 
 *******************************************************************************/
 
@@ -52,6 +57,7 @@
 #include "LTE_fdd_enb_rrc.h"
 #include "LTE_fdd_enb_pdcp.h"
 #include "LTE_fdd_enb_user_mgr.h"
+#include "libtools_scoped_lock.h"
 
 /*******************************************************************************
                               DEFINES
@@ -67,8 +73,8 @@
                               GLOBAL VARIABLES
 *******************************************************************************/
 
-LTE_fdd_enb_rrc* LTE_fdd_enb_rrc::instance = NULL;
-boost::mutex     rrc_instance_mutex;
+LTE_fdd_enb_rrc*       LTE_fdd_enb_rrc::instance = NULL;
+static pthread_mutex_t rrc_instance_mutex        = PTHREAD_MUTEX_INITIALIZER;
 
 /*******************************************************************************
                               CLASS IMPLEMENTATIONS
@@ -79,7 +85,7 @@ boost::mutex     rrc_instance_mutex;
 /*******************/
 LTE_fdd_enb_rrc* LTE_fdd_enb_rrc::get_instance(void)
 {
-    boost::mutex::scoped_lock lock(rrc_instance_mutex);
+    libtools_scoped_lock lock(rrc_instance_mutex);
 
     if(NULL == instance)
     {
@@ -90,7 +96,7 @@ LTE_fdd_enb_rrc* LTE_fdd_enb_rrc::get_instance(void)
 }
 void LTE_fdd_enb_rrc::cleanup(void)
 {
-    boost::mutex::scoped_lock lock(rrc_instance_mutex);
+    libtools_scoped_lock lock(rrc_instance_mutex);
 
     if(NULL != instance)
     {
@@ -104,11 +110,15 @@ void LTE_fdd_enb_rrc::cleanup(void)
 /********************************/
 LTE_fdd_enb_rrc::LTE_fdd_enb_rrc()
 {
+    sem_init(&start_sem, 0, 1);
+    sem_init(&sys_info_sem, 0, 1);
     started = false;
 }
 LTE_fdd_enb_rrc::~LTE_fdd_enb_rrc()
 {
     stop();
+    sem_destroy(&sys_info_sem);
+    sem_destroy(&start_sem);
 }
 
 /********************/
@@ -120,9 +130,9 @@ void LTE_fdd_enb_rrc::start(LTE_fdd_enb_msgq      *from_pdcp,
                             LTE_fdd_enb_msgq      *to_mme,
                             LTE_fdd_enb_interface *iface)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    LTE_fdd_enb_msgq_cb       pdcp_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rrc, &LTE_fdd_enb_rrc::handle_pdcp_msg>, this);
-    LTE_fdd_enb_msgq_cb       mme_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rrc, &LTE_fdd_enb_rrc::handle_mme_msg>, this);
+    libtools_scoped_lock lock(start_sem);
+    LTE_fdd_enb_msgq_cb  pdcp_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rrc, &LTE_fdd_enb_rrc::handle_pdcp_msg>, this);
+    LTE_fdd_enb_msgq_cb  mme_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rrc, &LTE_fdd_enb_rrc::handle_mme_msg>, this);
 
     if(!started)
     {
@@ -138,7 +148,7 @@ void LTE_fdd_enb_rrc::start(LTE_fdd_enb_msgq      *from_pdcp,
 }
 void LTE_fdd_enb_rrc::stop(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
 
     if(started)
     {
@@ -206,11 +216,10 @@ void LTE_fdd_enb_rrc::handle_mme_msg(LTE_FDD_ENB_MESSAGE_STRUCT &msg)
 /****************************/
 void LTE_fdd_enb_rrc::update_sys_info(void)
 {
-    LTE_fdd_enb_cnfg_db *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
+    libtools_scoped_lock  lock(sys_info_sem);
+    LTE_fdd_enb_cnfg_db  *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
 
-    sys_info_mutex.lock();
     cnfg_db->get_sys_info(sys_info);
-    sys_info_mutex.unlock();
 }
 
 /*******************************/
@@ -329,14 +338,15 @@ void LTE_fdd_enb_rrc::handle_cmd(LTE_FDD_ENB_RRC_CMD_READY_MSG_STRUCT *cmd)
             srb2->set_mme_procedure(cmd->rb->get_mme_procedure());
             srb2->set_mme_state(cmd->rb->get_mme_state());
             srb2->set_pdcp_config(cmd->rb->get_pdcp_config());
-            srb2->set_qos(cmd->rb->get_qos());
 
             // Configure DRB1
             drb1->set_eps_bearer_id(cmd->user->get_eps_bearer_id());
             drb1->set_drb_id(1);
             drb1->set_lc_id(3);
             drb1->set_log_chan_group(2);
-            drb1->set_qos(LTE_FDD_ENB_QOS_DEFAULT_DATA);
+
+            // Setup QoS for default data
+            cmd->user->set_qos(LTE_FDD_ENB_QOS_DEFAULT_DATA);
 
             if(LTE_FDD_ENB_ERROR_NONE == cmd->rb->get_next_rrc_nas_msg(&msg))
             {
@@ -364,21 +374,21 @@ void LTE_fdd_enb_rrc::handle_cmd(LTE_FDD_ENB_RRC_CMD_READY_MSG_STRUCT *cmd)
             srb2->set_mme_procedure(cmd->rb->get_mme_procedure());
             srb2->set_mme_state(cmd->rb->get_mme_state());
             srb2->set_pdcp_config(cmd->rb->get_pdcp_config());
-            srb2->set_qos(cmd->rb->get_qos());
 
             // Configure DRB1
             drb1->set_eps_bearer_id(cmd->user->get_eps_bearer_id());
             drb1->set_drb_id(1);
             drb1->set_lc_id(3);
             drb1->set_log_chan_group(2);
-            drb1->set_qos(LTE_FDD_ENB_QOS_DEFAULT_DATA);
 
             // Configure DRB2
             drb2->set_eps_bearer_id(cmd->user->get_eps_bearer_id()+1);
             drb2->set_drb_id(2);
             drb2->set_lc_id(4);
             drb2->set_log_chan_group(3);
-            drb2->set_qos(LTE_FDD_ENB_QOS_DEFAULT_DATA);
+
+            // Setup QoS for default data
+            cmd->user->set_qos(LTE_FDD_ENB_QOS_DEFAULT_DATA);
 
             if(LTE_FDD_ENB_ERROR_NONE == cmd->rb->get_next_rrc_nas_msg(&msg))
             {
@@ -437,7 +447,7 @@ void LTE_fdd_enb_rrc::ccch_sm(LIBLTE_BIT_MSG_STRUCT *msg,
                 // Setup uplink scheduling
                 srb1->set_rrc_procedure(LTE_FDD_ENB_RRC_PROC_RRC_CON_REQ);
                 srb1->set_rrc_state(LTE_FDD_ENB_RRC_STATE_WAIT_FOR_CON_SETUP_COMPLETE);
-                srb1->set_qos(LTE_FDD_ENB_QOS_SIGNALLING);
+                user->set_qos(LTE_FDD_ENB_QOS_SIGNALLING);
             }else{
                 interface->send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_ERROR,
                                           LTE_FDD_ENB_DEBUG_LEVEL_RRC,
@@ -645,7 +655,6 @@ void LTE_fdd_enb_rrc::parse_ul_dcch_message(LIBLTE_BIT_MSG_STRUCT *msg,
                           sizeof(LTE_FDD_ENB_MME_RRC_CMD_RESP_MSG_STRUCT));
         break;
     case LIBLTE_RRC_UL_DCCH_MSG_TYPE_RRC_CON_RECONFIG_COMPLETE:
-        rb->set_qos(LTE_FDD_ENB_QOS_NONE);
         break;
     default:
         interface->send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_ERROR,
@@ -736,15 +745,18 @@ void LTE_fdd_enb_rrc::send_rrc_con_reconfig(LTE_fdd_enb_user       *user,
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg_present                                 = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.discard_timer_present                   = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.discard_timer                           = LIBLTE_RRC_DISCARD_TIMER_INFINITY;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required_present   = false;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size_present             = true;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size                     = LIBLTE_RRC_PDCP_SN_SIZE_12_BITS;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required_present   = true;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required           = true;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size_present             = false;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.hdr_compression_rohc                    = false;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg_present                                  = true;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.rlc_mode                                 = LIBLTE_RRC_RLC_MODE_UM_BI;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_um_bi_rlc.sn_field_len                = LIBLTE_RRC_SN_FIELD_LENGTH_SIZE10;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_um_bi_rlc.sn_field_len                = LIBLTE_RRC_SN_FIELD_LENGTH_SIZE10;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_um_bi_rlc.t_reordering                = LIBLTE_RRC_T_REORDERING_MS50;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.rlc_mode                                 = LIBLTE_RRC_RLC_MODE_AM;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.t_poll_retx                    = LIBLTE_RRC_T_POLL_RETRANSMIT_MS45;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.poll_pdu                       = LIBLTE_RRC_POLL_PDU_INFINITY;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.poll_byte                      = LIBLTE_RRC_POLL_BYTE_INFINITY;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.max_retx_thresh                = LIBLTE_RRC_MAX_RETX_THRESHOLD_T4;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_am_rlc.t_reordering                   = LIBLTE_RRC_T_REORDERING_MS35;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_am_rlc.t_status_prohibit              = LIBLTE_RRC_T_STATUS_PROHIBIT_MS0;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_id_present                                     = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_id                                             = drb1->get_lc_id();
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_cnfg_present                                   = true;
@@ -766,15 +778,18 @@ void LTE_fdd_enb_rrc::send_rrc_con_reconfig(LTE_fdd_enb_user       *user,
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg_present                                 = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.discard_timer_present                   = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.discard_timer                           = LIBLTE_RRC_DISCARD_TIMER_INFINITY;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required_present   = false;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size_present             = true;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size                     = LIBLTE_RRC_PDCP_SN_SIZE_12_BITS;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required_present   = true;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_am_status_report_required           = true;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.rlc_um_pdcp_sn_size_present             = false;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].pdcp_cnfg.hdr_compression_rohc                    = false;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg_present                                  = true;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.rlc_mode                                 = LIBLTE_RRC_RLC_MODE_UM_BI;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_um_bi_rlc.sn_field_len                = LIBLTE_RRC_SN_FIELD_LENGTH_SIZE10;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_um_bi_rlc.sn_field_len                = LIBLTE_RRC_SN_FIELD_LENGTH_SIZE10;
-        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_um_bi_rlc.t_reordering                = LIBLTE_RRC_T_REORDERING_MS50;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.rlc_mode                                 = LIBLTE_RRC_RLC_MODE_AM;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.t_poll_retx                    = LIBLTE_RRC_T_POLL_RETRANSMIT_MS45;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.poll_pdu                       = LIBLTE_RRC_POLL_PDU_INFINITY;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.poll_byte                      = LIBLTE_RRC_POLL_BYTE_INFINITY;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.ul_am_rlc.max_retx_thresh                = LIBLTE_RRC_MAX_RETX_THRESHOLD_T4;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_am_rlc.t_reordering                   = LIBLTE_RRC_T_REORDERING_MS35;
+        rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].rlc_cnfg.dl_am_rlc.t_status_prohibit              = LIBLTE_RRC_T_STATUS_PROHIBIT_MS0;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_id_present                                     = true;
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_id                                             = drb2->get_lc_id();
         rrc_con_recnfg->rr_cnfg_ded.drb_to_add_mod_list[idx].lc_cnfg_present                                   = true;
@@ -872,7 +887,7 @@ void LTE_fdd_enb_rrc::send_rrc_con_setup(LTE_fdd_enb_user *user,
     rrc_con_setup->rr_cnfg.mac_main_cnfg.explicit_value.ulsch_cnfg.tti_bundling               = false;
     rrc_con_setup->rr_cnfg.mac_main_cnfg.explicit_value.drx_cnfg_present                      = false;
     rrc_con_setup->rr_cnfg.mac_main_cnfg.explicit_value.phr_cnfg_present                      = false;
-    rrc_con_setup->rr_cnfg.mac_main_cnfg.explicit_value.time_alignment_timer                  = LIBLTE_RRC_TIME_ALIGNMENT_TIMER_SF500;
+    rrc_con_setup->rr_cnfg.mac_main_cnfg.explicit_value.time_alignment_timer                  = LIBLTE_RRC_TIME_ALIGNMENT_TIMER_SF10240;
     rrc_con_setup->rr_cnfg.sps_cnfg_present                                                   = false;
     rrc_con_setup->rr_cnfg.phy_cnfg_ded_present                                               = false;
     rrc_con_setup->rr_cnfg.rlf_timers_and_constants_present                                   = false;

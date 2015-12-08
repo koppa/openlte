@@ -36,6 +36,11 @@
                                    timer support.
     12/16/2014    Ben Wojtowicz    Changed the delayed delete functionality.
     02/15/2015    Ben Wojtowicz    Added clear_rbs and fixed copy_rbs.
+    07/25/2015    Ben Wojtowicz    Moved the QoS structure from the RB class to
+                                   the user class.
+    12/06/2015    Ben Wojtowicz    Changed the deletion and C-RNTI release
+                                   procedures and changed the QoS parameters
+                                   for default data.
 
 *******************************************************************************/
 
@@ -46,6 +51,7 @@
 #include "LTE_fdd_enb_user.h"
 #include "LTE_fdd_enb_user_mgr.h"
 #include "LTE_fdd_enb_timer_mgr.h"
+#include "LTE_fdd_enb_mac.h"
 #include "liblte_mme.h"
 #include <boost/lexical_cast.hpp>
 
@@ -117,15 +123,21 @@ LTE_fdd_enb_user::LTE_fdd_enb_user()
     protocol_cnfg_opts.N_opts = 0;
 
     // MAC
-    dl_ndi = false;
-    ul_ndi = false;
+    ul_sched_timer_id = LTE_FDD_ENB_INVALID_TIMER_ID;
+    dl_ndi            = false;
+    ul_ndi            = false;
 
     // Generic
-    N_del_ticks = 0;
+    N_del_ticks  = 0;
+    avail_qos[0] = (LTE_FDD_ENB_QOS_STRUCT){LTE_FDD_ENB_QOS_NONE,          0,  0,   0,   0};
+    avail_qos[1] = (LTE_FDD_ENB_QOS_STRUCT){LTE_FDD_ENB_QOS_SIGNALLING,   20, 20,  22,  22};
+    avail_qos[2] = (LTE_FDD_ENB_QOS_STRUCT){LTE_FDD_ENB_QOS_DEFAULT_DATA, 10,  5, 100, 400};
+    qos          = LTE_FDD_ENB_QOS_NONE;
 }
 LTE_fdd_enb_user::~LTE_fdd_enb_user()
 {
-    uint32 i;
+    LTE_fdd_enb_timer_mgr *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
+    uint32                 i;
 
     // Radio Bearers
     for(i=0; i<8; i++)
@@ -135,6 +147,11 @@ LTE_fdd_enb_user::~LTE_fdd_enb_user()
     delete srb2;
     delete srb1;
     delete srb0;
+
+    if(LTE_FDD_ENB_INVALID_TIMER_ID != ul_sched_timer_id)
+    {
+        timer_mgr->stop_timer(ul_sched_timer_id);
+    }
 }
 
 /********************/
@@ -242,13 +259,6 @@ bool LTE_fdd_enb_user::is_c_rnti_set(void)
 {
     return(c_rnti_set);
 }
-void LTE_fdd_enb_user::start_c_rnti_release_timer(void)
-{
-    LTE_fdd_enb_timer_mgr *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
-    LTE_fdd_enb_timer_cb   timer_expiry_cb(&LTE_fdd_enb_timer_cb_wrapper<LTE_fdd_enb_user, &LTE_fdd_enb_user::handle_timer_expiry>, this);
-
-    timer_mgr->start_timer(500, timer_expiry_cb, &c_rnti_timer_id);
-}
 void LTE_fdd_enb_user::set_ip_addr(uint32 addr)
 {
     ip_addr     = addr;
@@ -261,6 +271,11 @@ uint32 LTE_fdd_enb_user::get_ip_addr(void)
 bool LTE_fdd_enb_user::is_ip_addr_set(void)
 {
     return(ip_addr_set);
+}
+void LTE_fdd_enb_user::prepare_for_deletion(void)
+{
+    // Let the C-RNTI timer cleanup the user
+    id_set = false;
 }
 
 /******************/
@@ -611,6 +626,20 @@ void LTE_fdd_enb_user::flip_ul_ndi(void)
 {
     ul_ndi ^= 1;
 }
+void LTE_fdd_enb_user::start_ul_sched_timer(uint32 m_seconds)
+{
+    LTE_fdd_enb_timer_mgr *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
+    LTE_fdd_enb_timer_cb   timer_expiry_cb(&LTE_fdd_enb_timer_cb_wrapper<LTE_fdd_enb_user, &LTE_fdd_enb_user::handle_timer_expiry>, this);
+
+    ul_sched_timer_m_seconds = m_seconds;
+    timer_mgr->start_timer(ul_sched_timer_m_seconds, timer_expiry_cb, &ul_sched_timer_id);
+}
+void LTE_fdd_enb_user::stop_ul_sched_timer(void)
+{
+    LTE_fdd_enb_timer_mgr *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
+
+    timer_mgr->stop_timer(ul_sched_timer_id);
+}
 
 /*****************/
 /*    Generic    */
@@ -625,11 +654,44 @@ uint32 LTE_fdd_enb_user::get_N_del_ticks(void)
 }
 void LTE_fdd_enb_user::handle_timer_expiry(uint32 timer_id)
 {
-    LTE_fdd_enb_user_mgr *user_mgr = LTE_fdd_enb_user_mgr::get_instance();
+    LTE_fdd_enb_mac *mac = LTE_fdd_enb_mac::get_instance();
 
-    if(timer_id == c_rnti_timer_id)
+    if(timer_id == ul_sched_timer_id)
     {
-        c_rnti_set = false;
-        user_mgr->release_c_rnti(c_rnti);
+        mac->sched_ul(this, avail_qos[qos].ul_bytes_per_subfn*8);
+        if(c_rnti_set)
+        {
+            start_ul_sched_timer(ul_sched_timer_m_seconds);
+        }
     }
+}
+void LTE_fdd_enb_user::set_qos(LTE_FDD_ENB_QOS_ENUM _qos)
+{
+    qos = _qos;
+    if(qos != LTE_FDD_ENB_QOS_NONE)
+    {
+        start_ul_sched_timer(avail_qos[qos].ul_tti_frequency-1);
+    }else{
+        stop_ul_sched_timer();
+    }
+}
+LTE_FDD_ENB_QOS_ENUM LTE_fdd_enb_user::get_qos(void)
+{
+    return(qos);
+}
+uint32 LTE_fdd_enb_user::get_qos_ul_tti_freq(void)
+{
+    return(avail_qos[qos].ul_tti_frequency);
+}
+uint32 LTE_fdd_enb_user::get_qos_dl_tti_freq(void)
+{
+    return(avail_qos[qos].dl_tti_frequency);
+}
+uint32 LTE_fdd_enb_user::get_qos_ul_bytes_per_subfn(void)
+{
+    return(avail_qos[qos].ul_bytes_per_subfn);
+}
+uint32 LTE_fdd_enb_user::get_qos_dl_bytes_per_subfn(void)
+{
+    return(avail_qos[qos].dl_bytes_per_subfn);
 }

@@ -43,6 +43,9 @@
     02/15/2015    Ben Wojtowicz    Moved to new message queue, added IP pcap
                                    support, and put error enum into common hdr.
     03/11/2015    Ben Wojtowicz    Made a common routine for formatting time.
+    07/25/2015    Ben Wojtowicz    Made tx_gain and rx_gain into config file
+                                   tracked parameters.
+    12/06/2015    Ben Wojtowicz    Changed boost::mutex to sem_t.
 
 *******************************************************************************/
 
@@ -57,7 +60,6 @@
 #include "LTE_fdd_enb_msgq.h"
 #include "liblte_common.h"
 #include "libtools_socket_wrap.h"
-#include <boost/thread/mutex.hpp>
 #include <string>
 
 /*******************************************************************************
@@ -177,13 +179,13 @@ typedef enum{
     LTE_FDD_ENB_PARAM_DNS_ADDR,
     LTE_FDD_ENB_PARAM_USE_CNFG_FILE,
     LTE_FDD_ENB_PARAM_USE_USER_FILE,
+    LTE_FDD_ENB_PARAM_TX_GAIN,
+    LTE_FDD_ENB_PARAM_RX_GAIN,
 
     // Radio parameters managed by LTE_fdd_enb_radio
     LTE_FDD_ENB_PARAM_AVAILABLE_RADIOS,
     LTE_FDD_ENB_PARAM_SELECTED_RADIO_NAME,
     LTE_FDD_ENB_PARAM_SELECTED_RADIO_IDX,
-    LTE_FDD_ENB_PARAM_TX_GAIN,
-    LTE_FDD_ENB_PARAM_RX_GAIN,
     LTE_FDD_ENB_PARAM_CLOCK_SOURCE,
 
     LTE_FDD_ENB_PARAM_N_ITEMS,
@@ -230,11 +232,11 @@ static const char LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_N_ITEMS][100] = {"ban
                                                                             "dns_addr",
                                                                             "use_cnfg_file",
                                                                             "use_user_file",
+                                                                            "tx_gain",
+                                                                            "rx_gain",
                                                                             "available_radios",
                                                                             "selected_radio_name",
                                                                             "selected_radio_idx",
-                                                                            "tx_gain",
-                                                                            "rx_gain",
                                                                             "clock_source"};
 
 typedef struct{
@@ -282,8 +284,8 @@ public:
     static void handle_debug_connect(void);
     static void handle_debug_disconnect(void);
     static void handle_debug_error(LIBTOOLS_SOCKET_WRAP_ERROR_ENUM err);
-    boost::mutex          ctrl_mutex;
-    boost::mutex          debug_mutex;
+    sem_t                 ctrl_sem;
+    sem_t                 debug_sem;
     FILE                 *lte_pcap_fd;
     FILE                 *ip_pcap_fd;
     libtools_socket_wrap *ctrl_socket;
@@ -317,7 +319,7 @@ private:
 
     // Variables
     std::map<std::string, LTE_FDD_ENB_VAR_STRUCT> var_map;
-    boost::mutex                                  start_mutex;
+    sem_t                                         start_sem;
     uint32                                        debug_type_mask;
     uint32                                        debug_level_mask;
     bool                                          shutdown;

@@ -33,6 +33,13 @@
     12/16/2014    Ben Wojtowicz    Added more decoding/encoding.
     12/24/2014    Ben Wojtowicz    Cleaned up the Time Zone and Time IE.
     02/15/2015    Ben Wojtowicz    Added more decoding/encoding.
+    07/25/2015    Ben Wojtowicz    Removed rb_id from pack routines as
+                                   33.401 section 8.1.1 specifies 0 as the
+                                   input to the security routines.  Thanks to
+                                   Przemek for finding this.  Added the length
+                                   indicator for eps_mobile_id.  Thanks to Paul
+                                   Sutton for finding this.
+    12/06/2015    Ben Wojtowicz    Added all ID types for Mobile Identity IE.
 
 *******************************************************************************/
 
@@ -302,25 +309,99 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_mobile_id_ie(LIBLTE_MME_MOBILE_ID_STRUCT  *mob
     if(mobile_id != NULL &&
        ie_ptr    != NULL)
     {
-        if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id)
+        if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id ||
+           LIBLTE_MME_MOBILE_ID_TYPE_IMEI == mobile_id->type_of_id)
         {
-            id = mobile_id->imsi;
-        }else if(LIBLTE_MME_MOBILE_ID_TYPE_IMEI == mobile_id->type_of_id){
-            id = mobile_id->imei;
-        }else{
-            // FIXME: Not handling these IDs
-            return(err);
-        }
+            if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id)
+            {
+                id = mobile_id->imsi;
+            }else{
+                id = mobile_id->imei;
+            }
+            **ie_ptr  = 8; // Length
+            *ie_ptr  += 1;
+            **ie_ptr  = (id[0] << 4) | (1 << 3) | mobile_id->type_of_id;
+            *ie_ptr  += 1;
+            for(i=0; i<7; i++)
+            {
+                (*ie_ptr)[i] = (id[i*2+2] << 4) | id[i*2+1];
+            }
+            *ie_ptr += 7;
 
-        **ie_ptr  = (id[0] << 4) | (1 << 3) | mobile_id->type_of_id;
-        *ie_ptr  += 1;
-        for(i=0; i<7; i++)
-        {
-            (*ie_ptr)[i] = (id[i*2+2] << 4) | id[i*2+1];
-        }
-        *ie_ptr += 7;
+            err = LIBLTE_SUCCESS;
+        }else if(LIBLTE_MME_MOBILE_ID_TYPE_IMEISV == mobile_id->type_of_id){
+            **ie_ptr  = 9; // Length
+            *ie_ptr  += 1;
+            **ie_ptr  = (id[0] << 4) | mobile_id->type_of_id;
+            *ie_ptr  += 1;
+            for(i=0; i<7; i++)
+            {
+                (*ie_ptr)[i] = (id[i*2+2] << 4) | id[i*2+1];
+            }
+            *ie_ptr  += 7;
+            **ie_ptr  = id[i*2+1];
+            *ie_ptr  += 1;
 
-        err = LIBLTE_SUCCESS;
+            err = LIBLTE_SUCCESS;
+        }else if(LIBLTE_MME_MOBILE_ID_TYPE_TMSI == mobile_id->type_of_id){
+            **ie_ptr  = 5; // Length
+            *ie_ptr  += 1;
+            **ie_ptr  = 0xF0 | mobile_id->type_of_id;
+            *ie_ptr  += 1;
+            **ie_ptr  = (mobile_id->tmsi >> 24) & 0xFF;
+            *ie_ptr  += 1;
+            **ie_ptr  = (mobile_id->tmsi >> 16) & 0xFF;
+            *ie_ptr  += 1;
+            **ie_ptr  = (mobile_id->tmsi >> 8) & 0xFF;
+            *ie_ptr  += 1;
+            **ie_ptr  = mobile_id->tmsi && 0xFF;
+            *ie_ptr  += 1;
+
+            err = LIBLTE_SUCCESS;
+        }else if(LIBLTE_MME_MOBILE_ID_TYPE_TMGI == mobile_id->type_of_id){
+            **ie_ptr = 4; // Length
+            if(mobile_id->tmgi.mbms_session_id_ind)
+            {
+                **ie_ptr = **ie_ptr + 1;
+            }else if(mobile_id->tmgi.mcc_mnc_ind){
+                **ie_ptr = **ie_ptr + 3;
+            }
+            *ie_ptr  += 1;
+            **ie_ptr  = ((mobile_id->tmgi.mbms_session_id_ind << 5) |
+                         (mobile_id->tmgi.mcc_mnc_ind << 4) |
+                         mobile_id->type_of_id);
+            *ie_ptr  += 1;
+            **ie_ptr  = (mobile_id->tmgi.mbms_service_id >> 16) & 0xFF;
+            *ie_ptr  += 1;
+            **ie_ptr  = (mobile_id->tmgi.mbms_service_id >> 8) & 0xFF;
+            *ie_ptr  += 1;
+            **ie_ptr  = mobile_id->tmgi.mbms_service_id & 0xFF;
+            *ie_ptr  += 1;
+            if(mobile_id->tmgi.mcc_mnc_ind)
+            {
+                **ie_ptr  = (((mobile_id->tmgi.mcc/10) % 10) << 4) | ((mobile_id->tmgi.mcc/100) % 10);
+                *ie_ptr  += 1;
+                if(mobile_id->tmgi.mnc < 100)
+                {
+                    **ie_ptr  = 0xF0 | (mobile_id->tmgi.mcc % 10);
+                    *ie_ptr  += 1;
+                    **ie_ptr  = ((mobile_id->tmgi.mnc % 10) << 4) | ((mobile_id->tmgi.mnc/10) % 10);
+                    *ie_ptr  += 1;
+                }else{
+                    **ie_ptr  = ((mobile_id->tmgi.mnc % 10) << 4) | (mobile_id->tmgi.mcc % 10);
+                    *ie_ptr  += 1;
+                    **ie_ptr  = (((mobile_id->tmgi.mnc/10) % 10) << 4) | ((mobile_id->tmgi.mnc/100) % 10);
+                    *ie_ptr  += 1;
+                }
+            }
+            if(mobile_id->tmgi.mbms_session_id_ind)
+            {
+                **ie_ptr  = mobile_id->tmgi.mbms_session_id;
+                *ie_ptr  += 1;
+            }
+
+            err = LIBLTE_SUCCESS;
+        }
     }
 
     return(err);
@@ -342,37 +423,87 @@ LIBLTE_ERROR_ENUM liblte_mme_unpack_mobile_id_ie(uint8                       **i
 
         mobile_id->type_of_id = **ie_ptr & 0x07;
 
-        if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id)
+        if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id ||
+           LIBLTE_MME_MOBILE_ID_TYPE_IMEI == mobile_id->type_of_id ||
+           LIBLTE_MME_MOBILE_ID_TYPE_IMEISV == mobile_id->type_of_id)
         {
-            id  = mobile_id->imsi;
-            odd = true;
-        }else if(LIBLTE_MME_MOBILE_ID_TYPE_IMEI == mobile_id->type_of_id){
-            id  = mobile_id->imei;
-            odd = true;
-        }else if(LIBLTE_MME_MOBILE_ID_TYPE_IMEISV == mobile_id->type_of_id){
-            id  = mobile_id->imeisv;
-            odd = false;
-        }else{
-            // FIXME: Not handling these IDs
-            return(err);
-        }
+            if(LIBLTE_MME_MOBILE_ID_TYPE_IMSI == mobile_id->type_of_id)
+            {
+                id  = mobile_id->imsi;
+                odd = true;
+            }else if(LIBLTE_MME_MOBILE_ID_TYPE_IMEI == mobile_id->type_of_id){
+                id  = mobile_id->imei;
+                odd = true;
+            }else{
+                id  = mobile_id->imeisv;
+                odd = false;
+            }
 
-        id[0]    = **ie_ptr >> 4;
-        *ie_ptr += 1;
-        for(i=0; i<7; i++)
-        {
-            id[i*2+1] = (*ie_ptr)[i] & 0x0F;
-            id[i*2+2] = (*ie_ptr)[i] >> 4;
-        }
-        if(odd)
-        {
-            *ie_ptr += 7;
-        }else{
-            id[i*2+1]  = (*ie_ptr)[i] & 0xF;
-            *ie_ptr   += 8;
-        }
+            id[0]    = **ie_ptr >> 4;
+            *ie_ptr += 1;
+            for(i=0; i<7; i++)
+            {
+                id[i*2+1] = (*ie_ptr)[i] & 0x0F;
+                id[i*2+2] = (*ie_ptr)[i] >> 4;
+            }
+            if(odd)
+            {
+                *ie_ptr += 7;
+            }else{
+                id[i*2+1]  = (*ie_ptr)[i] & 0xF;
+                *ie_ptr   += 8;
+            }
 
-        err = LIBLTE_SUCCESS;
+            err = LIBLTE_SUCCESS;
+        }else if(LIBLTE_MME_MOBILE_ID_TYPE_TMSI == mobile_id->type_of_id){
+            *ie_ptr         += 1;
+            mobile_id->tmsi  = (**ie_ptr) << 24;
+            *ie_ptr         += 1;
+            mobile_id->tmsi |= (**ie_ptr) << 16;
+            *ie_ptr         += 1;
+            mobile_id->tmsi |= (**ie_ptr) << 8;
+            *ie_ptr         += 1;
+            mobile_id->tmsi |= **ie_ptr;
+            *ie_ptr         += 1;
+
+            err = LIBLTE_SUCCESS;
+        }else if(LIBLTE_MME_MOBILE_ID_TYPE_TMGI == mobile_id->type_of_id){
+            mobile_id->tmgi.mbms_session_id_ind  = ((**ie_ptr) >> 5) & 0x01;
+            mobile_id->tmgi.mcc_mnc_ind          = ((**ie_ptr) >> 4) & 0x01;
+            *ie_ptr                             += 1;
+            mobile_id->tmgi.mbms_service_id      = (**ie_ptr) << 16;
+            *ie_ptr                             += 1;
+            mobile_id->tmgi.mbms_service_id     |= (**ie_ptr) << 8;
+            *ie_ptr                             += 1;
+            mobile_id->tmgi.mbms_service_id     |= **ie_ptr;
+            *ie_ptr                             += 1;
+            if(mobile_id->tmgi.mcc_mnc_ind)
+            {
+                mobile_id->tmgi.mcc  = ((**ie_ptr) & 0x0F)*100;
+                mobile_id->tmgi.mcc += (((**ie_ptr) >> 4) & 0x0F)*10;
+                *ie_ptr             += 1;
+                mobile_id->tmgi.mcc += (**ie_ptr) & 0x0F;
+                if(((**ie_ptr) & 0xF0) == 0xF0)
+                {
+                    *ie_ptr             += 1;
+                    mobile_id->tmgi.mnc  = ((**ie_ptr) & 0x0F)*10;
+                    mobile_id->tmgi.mnc += ((**ie_ptr) >> 4) & 0x0F;
+                }else{
+                    mobile_id->tmgi.mnc  = ((**ie_ptr) >> 4) & 0x0F;
+                    *ie_ptr             += 1;
+                    mobile_id->tmgi.mnc += ((**ie_ptr) & 0x0F)*100;
+                    mobile_id->tmgi.mnc += (((**ie_ptr) >> 4) & 0x0F)*10;
+                }
+                *ie_ptr += 1;
+            }
+            if(mobile_id->tmgi.mbms_session_id_ind)
+            {
+                mobile_id->tmgi.mbms_session_id  = **ie_ptr;
+                *ie_ptr                         += 1;
+            }
+
+            err = LIBLTE_SUCCESS;
+        }
     }
 
     return(err);
@@ -1384,9 +1515,9 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_eps_mobile_id_ie(LIBLTE_MME_EPS_MOBILE_ID_STRU
                 **ie_ptr  = (((eps_mobile_id->guti.mnc/10) % 10) << 4) | ((eps_mobile_id->guti.mnc/100) % 10);
                 *ie_ptr  += 1;
             }
-            **ie_ptr  = (eps_mobile_id->guti.mme_group_id >> 8) & 0x0F;
+            **ie_ptr  = (eps_mobile_id->guti.mme_group_id >> 8) & 0xFF;
             *ie_ptr  += 1;
-            **ie_ptr  = eps_mobile_id->guti.mme_group_id & 0x0F;
+            **ie_ptr  = eps_mobile_id->guti.mme_group_id & 0xFF;
             *ie_ptr  += 1;
             **ie_ptr  = eps_mobile_id->guti.mme_code;
             *ie_ptr  += 1;
@@ -1406,6 +1537,8 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_eps_mobile_id_ie(LIBLTE_MME_EPS_MOBILE_ID_STRU
                 id = eps_mobile_id->imei;
             }
 
+            **ie_ptr  = 8;
+            *ie_ptr  += 1;
             **ie_ptr  = (id[0] << 4) | (1 << 3) | eps_mobile_id->type_of_id;
             *ie_ptr  += 1;
             for(i=0; i<7; i++)
@@ -3716,7 +3849,8 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_access_point_name_ie(LIBLTE_MME_ACCESS_POINT_N
         label_len    = 0;
         while(apn->apn.length() > apn_idx)
         {
-            (*ie_ptr)[1+apn_idx+1] = (uint8)apn_str[apn_idx++];
+            (*ie_ptr)[1+apn_idx+1] = (uint8)apn_str[apn_idx];
+            apn_idx++;
             label_len++;
 
             if(apn_str[apn_idx] == '.')
@@ -4950,7 +5084,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_protected_nas_msg(LIBLTE_BYTE_MSG_STR
                                                              uint8                  *key_256,
                                                              uint32                  count,
                                                              uint8                   direction,
-                                                             uint8                   rb_id,
                                                              LIBLTE_BYTE_MSG_STRUCT *sec_msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -4990,7 +5123,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_protected_nas_msg(LIBLTE_BYTE_MSG_STR
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &sec_msg->msg[5],
                                      sec_msg->N_bytes-5,
@@ -5016,7 +5149,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_attach_accept_msg(LIBLTE_MME_ATTACH_ACCEPT_MSG
                                                     uint8                               *key_256,
                                                     uint32                               count,
                                                     uint8                                direction,
-                                                    uint8                                rb_id,
                                                     LIBLTE_BYTE_MSG_STRUCT              *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -5158,7 +5290,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_attach_accept_msg(LIBLTE_MME_ATTACH_ACCEPT_MSG
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -5334,7 +5466,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_attach_complete_msg(LIBLTE_MME_ATTACH_COMPLETE
                                                       uint8                                 *key_256,
                                                       uint32                                 count,
                                                       uint8                                  direction,
-                                                      uint8                                  rb_id,
                                                       LIBLTE_BYTE_MSG_STRUCT                *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -5377,7 +5508,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_attach_complete_msg(LIBLTE_MME_ATTACH_COMPLETE
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6186,7 +6317,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_detach_accept_msg(LIBLTE_MME_DETACH_ACCEPT_MSG
                                                     uint8                               *key_256,
                                                     uint32                               count,
                                                     uint8                                direction,
-                                                    uint8                                rb_id,
                                                     LIBLTE_BYTE_MSG_STRUCT              *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6226,7 +6356,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_detach_accept_msg(LIBLTE_MME_DETACH_ACCEPT_MSG
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6279,7 +6409,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_detach_request_msg(LIBLTE_MME_DETACH_REQUEST_M
                                                      uint8                                *key_256,
                                                      uint32                                count,
                                                      uint8                                 direction,
-                                                     uint8                                 rb_id,
                                                      LIBLTE_BYTE_MSG_STRUCT               *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6328,7 +6457,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_detach_request_msg(LIBLTE_MME_DETACH_REQUEST_M
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6389,7 +6518,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_downlink_nas_transport_msg(LIBLTE_MME_DOWNLINK
                                                              uint8                                        *key_256,
                                                              uint32                                        count,
                                                              uint8                                         direction,
-                                                             uint8                                         rb_id,
                                                              LIBLTE_BYTE_MSG_STRUCT                       *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6432,7 +6560,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_downlink_nas_transport_msg(LIBLTE_MME_DOWNLINK
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6488,7 +6616,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_emm_information_msg(LIBLTE_MME_EMM_INFORMATION
                                                       uint8                                 *key_256,
                                                       uint32                                 count,
                                                       uint8                                  direction,
-                                                      uint8                                  rb_id,
                                                       LIBLTE_BYTE_MSG_STRUCT                *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6567,7 +6694,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_emm_information_msg(LIBLTE_MME_EMM_INFORMATION
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6670,7 +6797,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_emm_status_msg(LIBLTE_MME_EMM_STATUS_MSG_STRUC
                                                  uint8                            *key_256,
                                                  uint32                            count,
                                                  uint8                             direction,
-                                                 uint8                             rb_id,
                                                  LIBLTE_BYTE_MSG_STRUCT           *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6713,7 +6839,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_emm_status_msg(LIBLTE_MME_EMM_STATUS_MSG_STRUC
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6775,7 +6901,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_extended_service_request_msg(LIBLTE_MME_EXTEND
                                                                uint8                                          *key_256,
                                                                uint32                                          count,
                                                                uint8                                           direction,
-                                                               uint8                                           rb_id,
                                                                LIBLTE_BYTE_MSG_STRUCT                         *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6848,7 +6973,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_extended_service_request_msg(LIBLTE_MME_EXTEND
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -6939,7 +7064,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_guti_reallocation_command_msg(LIBLTE_MME_GUTI_
                                                                 uint8                                           *key_256,
                                                                 uint32                                           count,
                                                                 uint8                                            direction,
-                                                                uint8                                            rb_id,
                                                                 LIBLTE_BYTE_MSG_STRUCT                          *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -6990,7 +7114,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_guti_reallocation_command_msg(LIBLTE_MME_GUTI_
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -7056,7 +7180,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_guti_reallocation_complete_msg(LIBLTE_MME_GUTI
                                                                  uint8                                            *key_256,
                                                                  uint32                                            count,
                                                                  uint8                                             direction,
-                                                                 uint8                                             rb_id,
                                                                  LIBLTE_BYTE_MSG_STRUCT                           *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -7096,7 +7219,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_guti_reallocation_complete_msg(LIBLTE_MME_GUTI
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -7287,7 +7410,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_mode_command_msg(LIBLTE_MME_SECURITY_
                                                             uint8                                       *key_256,
                                                             uint32                                       count,
                                                             uint8                                        direction,
-                                                            uint8                                        rb_id,
                                                             LIBLTE_BYTE_MSG_STRUCT                      *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -7362,7 +7484,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_mode_command_msg(LIBLTE_MME_SECURITY_
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -7455,7 +7577,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_mode_complete_msg(LIBLTE_MME_SECURITY
                                                              uint8                                        *key_256,
                                                              uint32                                        count,
                                                              uint8                                         direction,
-                                                             uint8                                         rb_id,
                                                              LIBLTE_BYTE_MSG_STRUCT                       *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -7503,7 +7624,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_security_mode_complete_msg(LIBLTE_MME_SECURITY
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -7634,7 +7755,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_service_reject_msg(LIBLTE_MME_SERVICE_REJECT_M
                                                      uint8                                *key_256,
                                                      uint32                                count,
                                                      uint8                                 direction,
-                                                     uint8                                 rb_id,
                                                      LIBLTE_BYTE_MSG_STRUCT               *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -7693,7 +7813,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_service_reject_msg(LIBLTE_MME_SERVICE_REJECT_M
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -7830,7 +7950,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_accept_msg(LIBLTE_MME_TRA
                                                                   uint8                                             *key_256,
                                                                   uint32                                             count,
                                                                   uint8                                              direction,
-                                                                  uint8                                              rb_id,
                                                                   LIBLTE_BYTE_MSG_STRUCT                            *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -7987,7 +8106,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_accept_msg(LIBLTE_MME_TRA
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -8185,7 +8304,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_complete_msg(LIBLTE_MME_T
                                                                     uint8                                               *key_256,
                                                                     uint32                                               count,
                                                                     uint8                                                direction,
-                                                                    uint8                                                rb_id,
                                                                     LIBLTE_BYTE_MSG_STRUCT                              *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -8225,7 +8343,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_complete_msg(LIBLTE_MME_T
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -8278,7 +8396,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_reject_msg(LIBLTE_MME_TRA
                                                                   uint8                                             *key_256,
                                                                   uint32                                             count,
                                                                   uint8                                              direction,
-                                                                  uint8                                              rb_id,
                                                                   LIBLTE_BYTE_MSG_STRUCT                            *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -8329,7 +8446,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_tracking_area_update_reject_msg(LIBLTE_MME_TRA
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -8405,7 +8522,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_uplink_nas_transport_msg(LIBLTE_MME_UPLINK_NAS
                                                            uint8                                      *key_256,
                                                            uint32                                      count,
                                                            uint8                                       direction,
-                                                           uint8                                       rb_id,
                                                            LIBLTE_BYTE_MSG_STRUCT                     *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -8448,7 +8564,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_uplink_nas_transport_msg(LIBLTE_MME_UPLINK_NAS
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -8504,7 +8620,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_downlink_generic_nas_transport_msg(LIBLTE_MME_
                                                                      uint8                                                *key_256,
                                                                      uint32                                                count,
                                                                      uint8                                                 direction,
-                                                                     uint8                                                 rb_id,
                                                                      LIBLTE_BYTE_MSG_STRUCT                               *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -8553,7 +8668,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_downlink_generic_nas_transport_msg(LIBLTE_MME_
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,
@@ -8615,7 +8730,6 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_uplink_generic_nas_transport_msg(LIBLTE_MME_UP
                                                                    uint8                                              *key_256,
                                                                    uint32                                              count,
                                                                    uint8                                               direction,
-                                                                   uint8                                               rb_id,
                                                                    LIBLTE_BYTE_MSG_STRUCT                             *msg)
 {
     LIBLTE_ERROR_ENUM  err     = LIBLTE_ERROR_INVALID_INPUTS;
@@ -8664,7 +8778,7 @@ LIBLTE_ERROR_ENUM liblte_mme_pack_uplink_generic_nas_transport_msg(LIBLTE_MME_UP
             // Calculate MAC
             liblte_security_128_eia2(&key_256[16],
                                      count,
-                                     rb_id,
+                                     0,
                                      direction,
                                      &msg->msg[5],
                                      msg->N_bytes-5,

@@ -40,6 +40,9 @@
                                    extension/multiple data support to UMD.
     03/11/2015    Ben Wojtowicz    Added header extension/multiple data support
                                    to AMD.
+    07/25/2015    Ben Wojtowicz    Using the new user QoS structure.
+    12/06/2015    Ben Wojtowicz    Changed boost::mutex to pthread_mutex_t and
+                                   sem_t.
 
 *******************************************************************************/
 
@@ -49,6 +52,7 @@
 
 #include "LTE_fdd_enb_rlc.h"
 #include "liblte_rlc.h"
+#include "libtools_scoped_lock.h"
 
 /*******************************************************************************
                               DEFINES
@@ -64,8 +68,8 @@
                               GLOBAL VARIABLES
 *******************************************************************************/
 
-LTE_fdd_enb_rlc* LTE_fdd_enb_rlc::instance = NULL;
-boost::mutex     rlc_instance_mutex;
+LTE_fdd_enb_rlc*       LTE_fdd_enb_rlc::instance = NULL;
+static pthread_mutex_t rlc_instance_mutex        = PTHREAD_MUTEX_INITIALIZER;
 
 /*******************************************************************************
                               CLASS IMPLEMENTATIONS
@@ -76,7 +80,7 @@ boost::mutex     rlc_instance_mutex;
 /*******************/
 LTE_fdd_enb_rlc* LTE_fdd_enb_rlc::get_instance(void)
 {
-    boost::mutex::scoped_lock lock(rlc_instance_mutex);
+    libtools_scoped_lock lock(rlc_instance_mutex);
 
     if(NULL == instance)
     {
@@ -87,7 +91,7 @@ LTE_fdd_enb_rlc* LTE_fdd_enb_rlc::get_instance(void)
 }
 void LTE_fdd_enb_rlc::cleanup(void)
 {
-    boost::mutex::scoped_lock lock(rlc_instance_mutex);
+    libtools_scoped_lock lock(rlc_instance_mutex);
 
     if(NULL != instance)
     {
@@ -101,11 +105,15 @@ void LTE_fdd_enb_rlc::cleanup(void)
 /********************************/
 LTE_fdd_enb_rlc::LTE_fdd_enb_rlc()
 {
+    sem_init(&start_sem, 0, 1);
+    sem_init(&sys_info_sem, 0, 1);
     started = false;
 }
 LTE_fdd_enb_rlc::~LTE_fdd_enb_rlc()
 {
     stop();
+    sem_destroy(&sys_info_sem);
+    sem_destroy(&start_sem);
 }
 
 /********************/
@@ -117,9 +125,9 @@ void LTE_fdd_enb_rlc::start(LTE_fdd_enb_msgq      *from_mac,
                             LTE_fdd_enb_msgq      *to_pdcp,
                             LTE_fdd_enb_interface *iface)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    LTE_fdd_enb_msgq_cb       mac_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rlc, &LTE_fdd_enb_rlc::handle_mac_msg>, this);
-    LTE_fdd_enb_msgq_cb       pdcp_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rlc, &LTE_fdd_enb_rlc::handle_pdcp_msg>, this);
+    libtools_scoped_lock lock(start_sem);
+    LTE_fdd_enb_msgq_cb  mac_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rlc, &LTE_fdd_enb_rlc::handle_mac_msg>, this);
+    LTE_fdd_enb_msgq_cb  pdcp_cb(&LTE_fdd_enb_msgq_cb_wrapper<LTE_fdd_enb_rlc, &LTE_fdd_enb_rlc::handle_pdcp_msg>, this);
 
     if(!started)
     {
@@ -135,7 +143,7 @@ void LTE_fdd_enb_rlc::start(LTE_fdd_enb_msgq      *from_mac,
 }
 void LTE_fdd_enb_rlc::stop(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
 
     if(started)
     {
@@ -200,11 +208,10 @@ void LTE_fdd_enb_rlc::handle_pdcp_msg(LTE_FDD_ENB_MESSAGE_STRUCT &msg)
 /****************************/
 void LTE_fdd_enb_rlc::update_sys_info(void)
 {
-    LTE_fdd_enb_cnfg_db *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
+    libtools_scoped_lock  lock(sys_info_sem);
+    LTE_fdd_enb_cnfg_db  *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
 
-    sys_info_mutex.lock();
     cnfg_db->get_sys_info(sys_info);
-    sys_info_mutex.unlock();
 }
 void LTE_fdd_enb_rlc::handle_retransmit(LIBLTE_RLC_AMD_PDU_STRUCT *amd,
                                         LTE_fdd_enb_user          *user,
@@ -552,9 +559,7 @@ void LTE_fdd_enb_rlc::handle_status_pdu(LIBLTE_BYTE_MSG_STRUCT *pdu,
 
     liblte_rlc_unpack_status_pdu(pdu, &status);
 
-    rb->rlc_update_transmission_buffer(status.ack_sn);
-
-    // FIXME: Handle NACK_SNs
+    rb->rlc_update_transmission_buffer(&status);
 
     interface->send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_INFO,
                               LTE_FDD_ENB_DEBUG_LEVEL_RLC,
@@ -649,7 +654,7 @@ void LTE_fdd_enb_rlc::handle_um_sdu(LIBLTE_BYTE_MSG_STRUCT *sdu,
     LIBLTE_RLC_UMD_PDU_STRUCT            umd;
     LIBLTE_BYTE_MSG_STRUCT               pdu;
     uint32                               byte_idx        = 0;
-    uint32                               bytes_per_subfn = rb->get_qos_dl_bytes_per_subfn();
+    uint32                               bytes_per_subfn = user->get_qos_dl_bytes_per_subfn();
     uint16                               vtus            = rb->get_rlc_vtus();
 
     if(sdu->N_bytes <= bytes_per_subfn)
@@ -743,7 +748,7 @@ void LTE_fdd_enb_rlc::handle_am_sdu(LIBLTE_BYTE_MSG_STRUCT *sdu,
 {
     LIBLTE_RLC_AMD_PDU_STRUCT amd;
     uint32                    byte_idx        = 0;
-    uint32                    bytes_per_subfn = rb->get_qos_dl_bytes_per_subfn();
+    uint32                    bytes_per_subfn = user->get_qos_dl_bytes_per_subfn();
     uint16                    vts             = rb->get_rlc_vts();
 
     if(sdu->N_bytes <= bytes_per_subfn)

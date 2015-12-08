@@ -1,7 +1,7 @@
 #line 2 "LTE_fdd_enb_radio.cc" // Make __FILE__ omit the path
 /*******************************************************************************
 
-    Copyright 2013-2014 Ben Wojtowicz
+    Copyright 2013-2015 Ben Wojtowicz
 
     This program is free software: you can redistribute it and/or modify
     it under the terms of the GNU Affero General Public License as published by
@@ -42,6 +42,10 @@
     12/16/2014    Ben Wojtowicz    Pulled in a patch from Ruben Merz to add
                                    USRP X300 support.
     12/24/2014    Ben Wojtowicz    Added more time spec information in debug.
+    07/25/2015    Ben Wojtowicz    Added parameters to abstract PHY sample rate
+                                   from radio sample rate.
+    12/06/2015    Ben Wojtowicz    Changed boost::mutex to pthread_mutex_t and
+                                   sem_t.
 
 *******************************************************************************/
 
@@ -53,6 +57,7 @@
 #include "LTE_fdd_enb_phy.h"
 #include "LTE_fdd_enb_gw.h"
 #include "liblte_interface.h"
+#include "libtools_scoped_lock.h"
 #include <uhd/device.hpp>
 #include <uhd/types/device_addr.hpp>
 #include <uhd/property_tree.hpp>
@@ -74,8 +79,8 @@
                               GLOBAL VARIABLES
 *******************************************************************************/
 
-LTE_fdd_enb_radio* LTE_fdd_enb_radio::instance = NULL;
-boost::mutex       radio_instance_mutex;
+LTE_fdd_enb_radio*     LTE_fdd_enb_radio::instance = NULL;
+static pthread_mutex_t radio_instance_mutex        = PTHREAD_MUTEX_INITIALIZER;
 
 /*******************************************************************************
                               CLASS IMPLEMENTATIONS
@@ -86,7 +91,7 @@ boost::mutex       radio_instance_mutex;
 /*******************/
 LTE_fdd_enb_radio* LTE_fdd_enb_radio::get_instance(void)
 {
-    boost::mutex::scoped_lock lock(radio_instance_mutex);
+    libtools_scoped_lock lock(radio_instance_mutex);
 
     if(NULL == instance)
     {
@@ -97,7 +102,7 @@ LTE_fdd_enb_radio* LTE_fdd_enb_radio::get_instance(void)
 }
 void LTE_fdd_enb_radio::cleanup(void)
 {
-    boost::mutex::scoped_lock lock(radio_instance_mutex);
+    libtools_scoped_lock lock(radio_instance_mutex);
 
     if(NULL != instance)
     {
@@ -111,24 +116,26 @@ void LTE_fdd_enb_radio::cleanup(void)
 /********************************/
 LTE_fdd_enb_radio::LTE_fdd_enb_radio()
 {
+    // Start/Stop
+    sem_init(&start_sem, 0, 1);
+    started = false;
+
     // Setup radios
     available_radios.num_radios = 0;
     get_available_radios();
 
     // Setup radio thread
-    get_sample_rate();
+    get_radio_sample_rate();
     N_tx_samps   = 0;
     N_rx_samps   = 0;
     tx_gain      = 0;
     rx_gain      = 0;
     clock_source = "internal";
-
-    // Start/Stop
-    started = false;
 }
 LTE_fdd_enb_radio::~LTE_fdd_enb_radio()
 {
     stop();
+    sem_destroy(&start_sem);
 }
 
 /********************/
@@ -136,28 +143,28 @@ LTE_fdd_enb_radio::~LTE_fdd_enb_radio()
 /********************/
 bool LTE_fdd_enb_radio::is_started(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
 
     return(started);
 }
 LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::start(void)
 {
-    boost::mutex::scoped_lock  lock(start_mutex);
-    LTE_fdd_enb_cnfg_db       *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
-    uhd::device_addr_t         hint;
-    uhd::device_addrs_t        devs = uhd::device::find(hint);
-    uhd::stream_args_t         stream_args("fc32");
-    LTE_FDD_ENB_ERROR_ENUM     err = LTE_FDD_ENB_ERROR_CANT_START;
-    int64                      dl_earfcn;
-    int64                      ul_earfcn;
-    bool                       master_clock_set = false;
+    LTE_fdd_enb_cnfg_db    *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
+    uhd::device_addr_t      hint;
+    uhd::device_addrs_t     devs = uhd::device::find(hint);
+    uhd::stream_args_t      stream_args("fc32");
+    LTE_FDD_ENB_ERROR_ENUM  err = LTE_FDD_ENB_ERROR_CANT_START;
+    int64                   dl_earfcn;
+    int64                   ul_earfcn;
+    bool                    master_clock_set = false;
 
+    sem_wait(&start_sem);
     if(false == started)
     {
         if(0 != selected_radio_idx)
         {
             started = true;
-            start_mutex.unlock();
+            sem_post(&start_sem);
             try
             {
                 // Get the DL and UL EARFCNs
@@ -191,8 +198,8 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::start(void)
                 }
                 if(master_clock_set)
                 {
-                    usrp->set_tx_rate(get_sample_rate());
-                    usrp->set_rx_rate(get_sample_rate());
+                    usrp->set_tx_rate(get_radio_sample_rate());
+                    usrp->set_rx_rate(get_radio_sample_rate());
                     usrp->set_tx_freq((double)liblte_interface_dl_earfcn_to_frequency(dl_earfcn));
                     usrp->set_rx_freq((double)liblte_interface_ul_earfcn_to_frequency(ul_earfcn));
                     usrp->set_tx_gain(tx_gain);
@@ -231,7 +238,10 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::start(void)
 
             err     = LTE_FDD_ENB_ERROR_NONE;
             started = true;
+            sem_post(&start_sem);
         }
+    }else{
+        sem_post(&start_sem);
     }
 
     std::string msg = str(boost::format("Radio: Returning, started=%1%") % started);
@@ -240,14 +250,14 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::start(void)
 }
 LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::stop(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    uhd::stream_cmd_t         cmd = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
-    LTE_FDD_ENB_ERROR_ENUM    err = LTE_FDD_ENB_ERROR_CANT_STOP;
+    uhd::stream_cmd_t      cmd = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+    LTE_FDD_ENB_ERROR_ENUM err = LTE_FDD_ENB_ERROR_CANT_STOP;
 
+    sem_wait(&start_sem);
     if(started)
     {
         started = false;
-        start_mutex.unlock();
+        sem_post(&start_sem);
         if(0 != selected_radio_idx)
         {
             usrp->issue_stream_cmd(cmd);
@@ -256,6 +266,8 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::stop(void)
         pthread_cancel(radio_thread);
         pthread_join(radio_thread, NULL);
         err = LTE_FDD_ENB_ERROR_NONE;
+    }else{
+        sem_post(&start_sem);
     }
 
     return(err);
@@ -335,8 +347,8 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_selected_radio_idx(uint32 idx)
 }
 uint32 LTE_fdd_enb_radio::get_tx_gain(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    uint32                    gain;
+    libtools_scoped_lock lock(start_sem);
+    uint32               gain;
 
     if(!started)
     {
@@ -354,7 +366,7 @@ uint32 LTE_fdd_enb_radio::get_tx_gain(void)
 }
 LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_tx_gain(uint32 gain)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
 
     tx_gain = gain;
     if(started)
@@ -369,8 +381,8 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_tx_gain(uint32 gain)
 }
 uint32 LTE_fdd_enb_radio::get_rx_gain(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    uint32                    gain;
+    libtools_scoped_lock lock(start_sem);
+    uint32               gain;
 
     if(!started)
     {
@@ -388,7 +400,7 @@ uint32 LTE_fdd_enb_radio::get_rx_gain(void)
 }
 LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_rx_gain(uint32 gain)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
 
     rx_gain = gain;
     if(started)
@@ -403,8 +415,8 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_rx_gain(uint32 gain)
 }
 std::string LTE_fdd_enb_radio::get_clock_source(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    std::string               source;
+    libtools_scoped_lock lock(start_sem);
+    std::string          source;
 
     if(!started)
     {
@@ -422,8 +434,8 @@ std::string LTE_fdd_enb_radio::get_clock_source(void)
 }
 LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_clock_source(std::string source)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
-    LTE_FDD_ENB_ERROR_ENUM    err = LTE_FDD_ENB_ERROR_OUT_OF_BOUNDS;
+    libtools_scoped_lock   lock(start_sem);
+    LTE_FDD_ENB_ERROR_ENUM err = LTE_FDD_ENB_ERROR_OUT_OF_BOUNDS;
 
     if("internal" == source ||
        "external" == source)
@@ -437,11 +449,10 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_radio::set_clock_source(std::string source)
 
     return(err);
 }
-uint32 LTE_fdd_enb_radio::get_sample_rate(void)
+uint32 LTE_fdd_enb_radio::get_phy_sample_rate(void)
 {
-    boost::mutex::scoped_lock  lock(start_mutex);
-    LTE_fdd_enb_cnfg_db       *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
-    int64                      dl_bw;
+    LTE_fdd_enb_cnfg_db *cnfg_db = LTE_fdd_enb_cnfg_db::get_instance();
+    int64                dl_bw;
 
     if(!started)
     {
@@ -473,6 +484,17 @@ uint32 LTE_fdd_enb_radio::get_sample_rate(void)
             N_samps_per_subfr = LIBLTE_PHY_N_SAMPS_PER_SUBFR_1_92MHZ;
             break;
         }
+    }
+
+    return(fs);
+}
+uint32 LTE_fdd_enb_radio::get_radio_sample_rate(void)
+{
+    libtools_scoped_lock lock(start_sem);
+
+    if(!started)
+    {
+        fs = get_phy_sample_rate();
     }
 
     return(fs);

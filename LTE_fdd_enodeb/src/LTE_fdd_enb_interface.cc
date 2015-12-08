@@ -45,6 +45,9 @@
     02/15/2015    Ben Wojtowicz    Moved to new message queue, added IP pcap
                                    support, and added UTC time to the log port.
     03/11/2015    Ben Wojtowicz    Made a common routine for formatting time.
+    07/25/2015    Ben Wojtowicz    Added config file support for TX/RX gains.
+    12/06/2015    Ben Wojtowicz    Changed boost::mutex to pthread_mutex_t and
+                                   sem_t.
 
 *******************************************************************************/
 
@@ -66,6 +69,7 @@
 #include "LTE_fdd_enb_radio.h"
 #include "LTE_fdd_enb_timer_mgr.h"
 #include "liblte_interface.h"
+#include "libtools_scoped_lock.h"
 #include <boost/lexical_cast.hpp>
 #include <iomanip>
 #include <arpa/inet.h>
@@ -84,10 +88,10 @@
                               GLOBAL VARIABLES
 *******************************************************************************/
 
-LTE_fdd_enb_interface* LTE_fdd_enb_interface::instance = NULL;
-boost::mutex           interface_instance_mutex;
-boost::mutex           ctrl_connect_mutex;
-boost::mutex           debug_connect_mutex;
+LTE_fdd_enb_interface* LTE_fdd_enb_interface::instance        = NULL;
+static pthread_mutex_t interface_instance_mutex               = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t ctrl_connect_mutex                     = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t debug_connect_mutex                    = PTHREAD_MUTEX_INITIALIZER;
 bool                   LTE_fdd_enb_interface::ctrl_connected  = false;
 bool                   LTE_fdd_enb_interface::debug_connected = false;
 
@@ -100,7 +104,7 @@ bool                   LTE_fdd_enb_interface::debug_connected = false;
 /*******************/
 LTE_fdd_enb_interface* LTE_fdd_enb_interface::get_instance(void)
 {
-    boost::mutex::scoped_lock lock(interface_instance_mutex);
+    libtools_scoped_lock lock(interface_instance_mutex);
 
     if(NULL == instance)
     {
@@ -111,7 +115,7 @@ LTE_fdd_enb_interface* LTE_fdd_enb_interface::get_instance(void)
 }
 void LTE_fdd_enb_interface::cleanup(void)
 {
-    boost::mutex::scoped_lock lock(interface_instance_mutex);
+    libtools_scoped_lock lock(interface_instance_mutex);
 
     if(NULL != instance)
     {
@@ -128,6 +132,8 @@ LTE_fdd_enb_interface::LTE_fdd_enb_interface()
     uint32 i;
 
     // Communication
+    sem_init(&ctrl_sem, 0, 1);
+    sem_init(&debug_sem, 0, 1);
     ctrl_socket     = NULL;
     debug_socket    = NULL;
     ctrl_port       = LTE_FDD_ENB_DEFAULT_CTRL_PORT;
@@ -136,6 +142,7 @@ LTE_fdd_enb_interface::LTE_fdd_enb_interface()
     debug_connected = false;
 
     // Variables
+    sem_init(&start_sem, 0, 1);
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_BANDWIDTH]]          = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_DOUBLE, LTE_FDD_ENB_PARAM_BANDWIDTH, 0, 0, 0, 0, true, false, false};
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_FREQ_BAND]]          = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_FREQ_BAND, 0, 0, 0, 0, true, true, false};
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_DL_EARFCN]]          = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_DL_EARFCN, 0, 0, 0, 0, true, true, false};
@@ -166,6 +173,8 @@ LTE_fdd_enb_interface::LTE_fdd_enb_interface()
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_DNS_ADDR]]           = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_HEX, LTE_FDD_ENB_PARAM_DNS_ADDR, 0, 0, 0, 0, true, false, false};
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_USE_CNFG_FILE]]      = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_USE_CNFG_FILE, 0, 0, 0, 1, false, true, false};
     var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_USE_USER_FILE]]      = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_USE_USER_FILE, 0, 0, 0, 1, false, true, false};
+    var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_TX_GAIN]]            = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_TX_GAIN, 0, 0, 0, 100, false, true, false};
+    var_map[LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_RX_GAIN]]            = (LTE_FDD_ENB_VAR_STRUCT){LTE_FDD_ENB_VAR_TYPE_INT64, LTE_FDD_ENB_PARAM_RX_GAIN, 0, 0, 0, 100, false, true, false};
 
     debug_type_mask = 0;
     for(i=0; i<LTE_FDD_ENB_DEBUG_TYPE_N_ITEMS; i++)
@@ -188,6 +197,10 @@ LTE_fdd_enb_interface::~LTE_fdd_enb_interface()
 
     fclose(lte_pcap_fd);
     fclose(ip_pcap_fd);
+
+    sem_destroy(&start_sem);
+    sem_destroy(&ctrl_sem);
+    sem_destroy(&debug_sem);
 }
 
 /***********************/
@@ -195,8 +208,8 @@ LTE_fdd_enb_interface::~LTE_fdd_enb_interface()
 /***********************/
 void LTE_fdd_enb_interface::set_ctrl_port(int16 port)
 {
-    boost::mutex::scoped_lock c_lock(ctrl_connect_mutex);
-    boost::mutex::scoped_lock d_lock(debug_connect_mutex);
+    libtools_scoped_lock c_lock(ctrl_connect_mutex);
+    libtools_scoped_lock d_lock(debug_connect_mutex);
 
     if(!ctrl_connected)
     {
@@ -209,8 +222,8 @@ void LTE_fdd_enb_interface::set_ctrl_port(int16 port)
 }
 void LTE_fdd_enb_interface::start_ports(void)
 {
-    boost::mutex::scoped_lock       c_lock(ctrl_mutex);
-    boost::mutex::scoped_lock       d_lock(debug_mutex);
+    libtools_scoped_lock            c_lock(ctrl_sem);
+    libtools_scoped_lock            d_lock(debug_sem);
     LIBTOOLS_SOCKET_WRAP_ERROR_ENUM error;
 
     if(NULL == debug_socket)
@@ -253,8 +266,8 @@ void LTE_fdd_enb_interface::start_ports(void)
 }
 void LTE_fdd_enb_interface::stop_ports(void)
 {
-    boost::mutex::scoped_lock c_lock(ctrl_mutex);
-    boost::mutex::scoped_lock d_lock(debug_mutex);
+    libtools_scoped_lock c_lock(ctrl_sem);
+    libtools_scoped_lock d_lock(debug_sem);
 
     if(NULL != ctrl_socket)
     {
@@ -269,8 +282,8 @@ void LTE_fdd_enb_interface::stop_ports(void)
 }
 void LTE_fdd_enb_interface::send_ctrl_msg(std::string msg)
 {
-    boost::mutex::scoped_lock lock(ctrl_connect_mutex);
-    std::string               tmp_msg;
+    libtools_scoped_lock lock(ctrl_connect_mutex);
+    std::string          tmp_msg;
 
     if(ctrl_connected)
     {
@@ -282,10 +295,10 @@ void LTE_fdd_enb_interface::send_ctrl_msg(std::string msg)
 void LTE_fdd_enb_interface::send_ctrl_info_msg(std::string msg,
                                                ...)
 {
-    boost::mutex::scoped_lock  lock(ctrl_connect_mutex);
-    std::string                tmp_msg;
-    va_list                    args;
-    char                      *args_msg;
+    libtools_scoped_lock  lock(ctrl_connect_mutex);
+    std::string           tmp_msg;
+    va_list               args;
+    char                 *args_msg;
 
     if(ctrl_connected)
     {
@@ -306,8 +319,8 @@ void LTE_fdd_enb_interface::send_ctrl_info_msg(std::string msg,
 void LTE_fdd_enb_interface::send_ctrl_error_msg(LTE_FDD_ENB_ERROR_ENUM error,
                                                 std::string            msg)
 {
-    boost::mutex::scoped_lock lock(ctrl_connect_mutex);
-    std::string               tmp_msg;
+    libtools_scoped_lock lock(ctrl_connect_mutex);
+    std::string          tmp_msg;
 
     if(ctrl_connected)
     {
@@ -332,10 +345,10 @@ void LTE_fdd_enb_interface::send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_ENUM  type,
                                            std::string                  msg,
                                            ...)
 {
-    boost::mutex::scoped_lock  lock(debug_connect_mutex);
-    std::string                tmp_msg;
-    va_list                    args;
-    char                      *args_msg;
+    libtools_scoped_lock  lock(debug_connect_mutex);
+    std::string           tmp_msg;
+    va_list               args;
+    char                 *args_msg;
 
     if(debug_connected                 &&
        (debug_type_mask & (1 << type)) &&
@@ -373,12 +386,12 @@ void LTE_fdd_enb_interface::send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_ENUM   type,
                                            std::string                   msg,
                                            ...)
 {
-    boost::mutex::scoped_lock  lock(debug_connect_mutex);
-    std::string                tmp_msg;
-    va_list                    args;
-    uint32                     i;
-    uint32                     hex_val;
-    char                      *args_msg;
+    libtools_scoped_lock  lock(debug_connect_mutex);
+    std::string           tmp_msg;
+    va_list               args;
+    uint32                i;
+    uint32                hex_val;
+    char                 *args_msg;
 
     if(debug_connected                 &&
        (debug_type_mask & (1 << type)) &&
@@ -446,12 +459,12 @@ void LTE_fdd_enb_interface::send_debug_msg(LTE_FDD_ENB_DEBUG_TYPE_ENUM   type,
                                            std::string                   msg,
                                            ...)
 {
-    boost::mutex::scoped_lock  lock(debug_connect_mutex);
-    std::string                tmp_msg;
-    va_list                    args;
-    uint32                     i;
-    uint32                     hex_val;
-    char                      *args_msg;
+    libtools_scoped_lock  lock(debug_connect_mutex);
+    std::string           tmp_msg;
+    va_list               args;
+    uint32                i;
+    uint32                hex_val;
+    char                 *args_msg;
 
     if(debug_connected                 &&
        (debug_type_mask & (1 << type)) &&
@@ -573,7 +586,7 @@ void LTE_fdd_enb_interface::send_lte_pcap_msg(LTE_FDD_ENB_PCAP_DIRECTION_ENUM  d
     uint32               tmp_u32;
     uint16               tmp_u16;
     uint8                pcap_c_hdr[15];
-    uint8                pcap_msg[LIBLTE_MAX_MSG_SIZE/8];
+    uint8                pcap_msg[LIBLTE_MAX_MSG_SIZE*2];
 
     cnfg_db->get_param(LTE_FDD_ENB_PARAM_ENABLE_PCAP, enable_pcap);
 
@@ -723,9 +736,9 @@ void LTE_fdd_enb_interface::handle_ctrl_msg(std::string msg)
 }
 void LTE_fdd_enb_interface::handle_ctrl_connect(void)
 {
-    ctrl_connect_mutex.lock();
+    pthread_mutex_lock(&ctrl_connect_mutex);
     LTE_fdd_enb_interface::ctrl_connected = true;
-    ctrl_connect_mutex.unlock();
+    pthread_mutex_unlock(&ctrl_connect_mutex);
 
     LTE_fdd_enb_interface *interface = LTE_fdd_enb_interface::get_instance();
 
@@ -734,7 +747,7 @@ void LTE_fdd_enb_interface::handle_ctrl_connect(void)
 }
 void LTE_fdd_enb_interface::handle_ctrl_disconnect(void)
 {
-    boost::mutex::scoped_lock lock(ctrl_connect_mutex);
+    libtools_scoped_lock lock(ctrl_connect_mutex);
 
     LTE_fdd_enb_interface::ctrl_connected = false;
 }
@@ -756,9 +769,9 @@ void LTE_fdd_enb_interface::handle_debug_msg(std::string msg)
 }
 void LTE_fdd_enb_interface::handle_debug_connect(void)
 {
-    debug_connect_mutex.lock();
+    pthread_mutex_lock(&debug_connect_mutex);
     LTE_fdd_enb_interface::debug_connected = true;
-    debug_connect_mutex.unlock();
+    pthread_mutex_unlock(&debug_connect_mutex);
 
     LTE_fdd_enb_interface *interface = LTE_fdd_enb_interface::get_instance();
 
@@ -770,7 +783,7 @@ void LTE_fdd_enb_interface::handle_debug_connect(void)
 }
 void LTE_fdd_enb_interface::handle_debug_disconnect(void)
 {
-    boost::mutex::scoped_lock lock(debug_connect_mutex);
+    libtools_scoped_lock lock(debug_connect_mutex);
 
     LTE_fdd_enb_interface::debug_connected = false;
 }
@@ -868,10 +881,6 @@ void LTE_fdd_enb_interface::handle_read(std::string msg)
                 send_ctrl_error_msg(LTE_FDD_ENB_ERROR_NONE, selected_radio.name);
             }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_SELECTED_RADIO_IDX])){
                 send_ctrl_error_msg(LTE_FDD_ENB_ERROR_NONE, boost::lexical_cast<std::string>(radio->get_selected_radio_idx()));
-            }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_TX_GAIN])){
-                send_ctrl_error_msg(LTE_FDD_ENB_ERROR_NONE, boost::lexical_cast<std::string>(radio->get_tx_gain()));
-            }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_RX_GAIN])){
-                send_ctrl_error_msg(LTE_FDD_ENB_ERROR_NONE, boost::lexical_cast<std::string>(radio->get_rx_gain()));
             }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_CLOCK_SOURCE])){
                 send_ctrl_error_msg(LTE_FDD_ENB_ERROR_NONE, radio->get_clock_source());
             }else{
@@ -954,12 +963,6 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_interface::handle_write(std::string msg)
             {
                 u_value = boost::lexical_cast<uint32>(msg.substr(msg.find(" ")+1, std::string::npos));
                 err = radio->set_selected_radio_idx(u_value);
-            }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_TX_GAIN])){
-                u_value = boost::lexical_cast<uint32>(msg.substr(msg.find(" ")+1, std::string::npos));
-                err = radio->set_tx_gain(u_value);
-            }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_RX_GAIN])){
-                u_value = boost::lexical_cast<uint32>(msg.substr(msg.find(" ")+1, std::string::npos));
-                err = radio->set_rx_gain(u_value);
             }else if(std::string::npos != msg.find(LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_CLOCK_SOURCE])){
                 err = radio->set_clock_source(msg.substr(msg.find(" ")+1, std::string::npos));
             }else{
@@ -974,24 +977,24 @@ LTE_FDD_ENB_ERROR_ENUM LTE_fdd_enb_interface::handle_write(std::string msg)
 }
 void LTE_fdd_enb_interface::handle_start(void)
 {
-    boost::mutex::scoped_lock  lock(start_mutex);
-    LTE_fdd_enb_cnfg_db       *cnfg_db   = LTE_fdd_enb_cnfg_db::get_instance();
-    LTE_fdd_enb_mac           *mac       = LTE_fdd_enb_mac::get_instance();
-    LTE_fdd_enb_rlc           *rlc       = LTE_fdd_enb_rlc::get_instance();
-    LTE_fdd_enb_pdcp          *pdcp      = LTE_fdd_enb_pdcp::get_instance();
-    LTE_fdd_enb_rrc           *rrc       = LTE_fdd_enb_rrc::get_instance();
-    LTE_fdd_enb_mme           *mme       = LTE_fdd_enb_mme::get_instance();
-    LTE_fdd_enb_gw            *gw        = LTE_fdd_enb_gw::get_instance();
-    LTE_fdd_enb_phy           *phy       = LTE_fdd_enb_phy::get_instance();
-    LTE_fdd_enb_radio         *radio     = LTE_fdd_enb_radio::get_instance();
-    LTE_fdd_enb_timer_mgr     *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
-    LTE_FDD_ENB_ERROR_ENUM     err;
-    char                       err_str[LTE_FDD_ENB_MAX_LINE_SIZE];
+    LTE_fdd_enb_cnfg_db    *cnfg_db   = LTE_fdd_enb_cnfg_db::get_instance();
+    LTE_fdd_enb_mac        *mac       = LTE_fdd_enb_mac::get_instance();
+    LTE_fdd_enb_rlc        *rlc       = LTE_fdd_enb_rlc::get_instance();
+    LTE_fdd_enb_pdcp       *pdcp      = LTE_fdd_enb_pdcp::get_instance();
+    LTE_fdd_enb_rrc        *rrc       = LTE_fdd_enb_rrc::get_instance();
+    LTE_fdd_enb_mme        *mme       = LTE_fdd_enb_mme::get_instance();
+    LTE_fdd_enb_gw         *gw        = LTE_fdd_enb_gw::get_instance();
+    LTE_fdd_enb_phy        *phy       = LTE_fdd_enb_phy::get_instance();
+    LTE_fdd_enb_radio      *radio     = LTE_fdd_enb_radio::get_instance();
+    LTE_fdd_enb_timer_mgr  *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
+    LTE_FDD_ENB_ERROR_ENUM  err;
+    char                    err_str[LTE_FDD_ENB_MAX_LINE_SIZE];
 
+    sem_wait(&start_sem);
     if(!started)
     {
         started = true;
-        start_mutex.unlock();
+        sem_post(&start_sem);
 
         // Construct the system information
         cnfg_db->construct_sys_info();
@@ -1027,12 +1030,13 @@ void LTE_fdd_enb_interface::handle_start(void)
             {
                 send_ctrl_error_msg(err, "");
             }else{
-                start_mutex.lock();
+                sem_wait(&start_sem);
                 started = false;
-                start_mutex.unlock();
+                sem_post(&start_sem);
 
                 phy->stop();
                 mac->stop();
+                timer_mgr->stop();
                 rlc->stop();
                 pdcp->stop();
                 rrc->stop();
@@ -1044,26 +1048,28 @@ void LTE_fdd_enb_interface::handle_start(void)
             send_ctrl_error_msg(err, err_str);
         }
     }else{
+        sem_post(&start_sem);
         send_ctrl_error_msg(LTE_FDD_ENB_ERROR_ALREADY_STARTED, "");
     }
 }
 void LTE_fdd_enb_interface::handle_stop(void)
 {
-    boost::mutex::scoped_lock  lock(start_mutex);
-    LTE_fdd_enb_radio         *radio = LTE_fdd_enb_radio::get_instance();
-    LTE_fdd_enb_phy           *phy   = LTE_fdd_enb_phy::get_instance();
-    LTE_fdd_enb_mac           *mac   = LTE_fdd_enb_mac::get_instance();
-    LTE_fdd_enb_rlc           *rlc   = LTE_fdd_enb_rlc::get_instance();
-    LTE_fdd_enb_pdcp          *pdcp  = LTE_fdd_enb_pdcp::get_instance();
-    LTE_fdd_enb_rrc           *rrc   = LTE_fdd_enb_rrc::get_instance();
-    LTE_fdd_enb_mme           *mme   = LTE_fdd_enb_mme::get_instance();
-    LTE_fdd_enb_gw            *gw    = LTE_fdd_enb_gw::get_instance();
-    LTE_FDD_ENB_ERROR_ENUM     err;
+    LTE_fdd_enb_timer_mgr  *timer_mgr = LTE_fdd_enb_timer_mgr::get_instance();
+    LTE_fdd_enb_radio      *radio     = LTE_fdd_enb_radio::get_instance();
+    LTE_fdd_enb_phy        *phy       = LTE_fdd_enb_phy::get_instance();
+    LTE_fdd_enb_mac        *mac       = LTE_fdd_enb_mac::get_instance();
+    LTE_fdd_enb_rlc        *rlc       = LTE_fdd_enb_rlc::get_instance();
+    LTE_fdd_enb_pdcp       *pdcp      = LTE_fdd_enb_pdcp::get_instance();
+    LTE_fdd_enb_rrc        *rrc       = LTE_fdd_enb_rrc::get_instance();
+    LTE_fdd_enb_mme        *mme       = LTE_fdd_enb_mme::get_instance();
+    LTE_fdd_enb_gw         *gw        = LTE_fdd_enb_gw::get_instance();
+    LTE_FDD_ENB_ERROR_ENUM  err;
 
+    sem_wait(&start_sem);
     if(started)
     {
         started = false;
-        start_mutex.unlock();
+        sem_post(&start_sem);
 
         // Stop all layers
         err = radio->stop();
@@ -1071,6 +1077,7 @@ void LTE_fdd_enb_interface::handle_stop(void)
         {
             phy->stop();
             mac->stop();
+            timer_mgr->stop();
             rlc->stop();
             pdcp->stop();
             rrc->stop();
@@ -1148,6 +1155,7 @@ void LTE_fdd_enb_interface::handle_stop(void)
             LTE_fdd_enb_radio::cleanup();
             LTE_fdd_enb_phy::cleanup();
             LTE_fdd_enb_mac::cleanup();
+            LTE_fdd_enb_timer_mgr::cleanup();
             LTE_fdd_enb_rlc::cleanup();
             LTE_fdd_enb_pdcp::cleanup();
             LTE_fdd_enb_rrc::cleanup();
@@ -1159,6 +1167,7 @@ void LTE_fdd_enb_interface::handle_stop(void)
             send_ctrl_error_msg(err, "");
         }
     }else{
+        sem_post(&start_sem);
         send_ctrl_error_msg(LTE_FDD_ENB_ERROR_ALREADY_STOPPED, "");
     }
 }
@@ -1220,26 +1229,6 @@ void LTE_fdd_enb_interface::handle_help(void)
     try
     {
         tmp_str += boost::lexical_cast<std::string>(radio->get_selected_radio_idx());
-    }catch(...){
-        // Intentionally do nothing
-    }
-    send_ctrl_msg(tmp_str);
-    tmp_str  = "\t\t";
-    tmp_str += LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_TX_GAIN];
-    tmp_str += " = ";
-    try
-    {
-        tmp_str += boost::lexical_cast<std::string>(radio->get_tx_gain());
-    }catch(...){
-        // Intentionally do nothing
-    }
-    send_ctrl_msg(tmp_str);
-    tmp_str  = "\t\t";
-    tmp_str += LTE_fdd_enb_param_text[LTE_FDD_ENB_PARAM_RX_GAIN];
-    tmp_str += " = ";
-    try
-    {
-        tmp_str += boost::lexical_cast<std::string>(radio->get_rx_gain());
     }catch(...){
         // Intentionally do nothing
     }
@@ -1375,7 +1364,7 @@ bool LTE_fdd_enb_interface::get_shutdown(void)
 }
 bool LTE_fdd_enb_interface::app_is_started(void)
 {
-    boost::mutex::scoped_lock lock(start_mutex);
+    libtools_scoped_lock lock(start_sem);
     return(started);
 }
 
